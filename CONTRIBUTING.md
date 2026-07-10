@@ -28,3 +28,7 @@ If you're making a pull request, please ensure it adheres to the following guide
 ## Dead Link Policy
 
 We check all links are valid with the awesome [awesome_bot](https://github.com/dkhamsing/awesome_bot). If links die, we remove them - this saves time for the maintainers, and ensures awesome links. We'd be happy to accept PRs to re-add new links.
+
+## Net-New Resources
+
+Found a genuinely new remote job board, tool, or resource that isn't in the upstream list yet? Call that out explicitly in your PR description — keeping this list ahead of stale duplicates is part of what makes it worth maintaining.

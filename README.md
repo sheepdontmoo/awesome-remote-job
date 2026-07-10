@@ -1,6 +1,8 @@
 # Awesome Remote Job [![Awesome](https://cdn.jsdelivr.net/gh/sindresorhus/awesome@d7305f38d29fed78fa85652e3a63e154dd8e8829/media/badge.svg)](https://github.com/sindresorhus/awesome) [![Track Awesome List](https://www.trackawesomelist.com/badge.svg)](https://www.trackawesomelist.com/lukasz-madon/awesome-remote-job/)
 
-A curated list of awesome [remote working](https://en.wikipedia.org/wiki/Telecommuting) resources.
+**Awesome Remote Job** is a curated, actively-maintained list of remote job boards, companies with genuine "remote DNA," relocation and visa resources, and tools for building a [remote working](https://en.wikipedia.org/wiki/Telecommuting) career. Every entry is vetted for quality — no paywalls, no forced logins — and dead links are checked on every change.
+
+_Last verified: July 2026._
 
 ## Languages
 
@@ -18,6 +20,7 @@ A curated list of awesome [remote working](https://en.wikipedia.org/wiki/Telecom
 - [Awesome Remote Job  ](#awesome-remote-job--)
   - [Languages](#languages)
   - [Table of Contents](#table-of-contents)
+  - [FAQ](#faq)
   - [Articles \& Posts](#articles--posts)
   - [Videos](#videos)
   - [Books](#books)
@@ -45,6 +48,24 @@ A curated list of awesome [remote working](https://en.wikipedia.org/wiki/Telecom
   - [License](#license)
 
 <!-- /MarkdownTOC -->
+
+## FAQ
+
+#### What are the best remote job boards?
+
+There's no single "best" board — quality depends on your field and seniority. This list's [Job boards](#job-boards) section only includes boards that are vetted, don't require a paywall or forced login, and are meaningfully different from one another; the [Job boards aggregators](#job-boards-aggregators) section covers sites that pull listings from many boards at once.
+
+#### How do I find a legitimate remote job?
+
+Stick to job boards and company career pages rather than unsolicited offers, verify the company has a real track record (check the [Companies with "remote DNA"](#companies-with-remote-dna) section for examples), and be wary of any "job" that asks you to pay for equipment or training upfront.
+
+#### What makes a company genuinely remote-first, not just remote-friendly?
+
+A remote-first company builds its processes — hiring, documentation, communication — around distributed teams by default, rather than allowing remote work as an exception to an office-centric culture. See [Companies with "remote DNA"](#companies-with-remote-dna) for companies that meet that bar.
+
+#### How often is this list updated?
+
+Links are checked automatically on every change via CI, and broken links are removed per the [Dead Link Policy](CONTRIBUTING.md#dead-link-policy). See the "Last verified" date at the top of this README.
 
 ## Articles & Posts
   1. [3 mistakes to avoid if you want to get hired remotely](https://x-team.com/blog/mistakes-remote-developers)

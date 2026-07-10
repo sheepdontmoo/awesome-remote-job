@@ -1,0 +1,28 @@
+# Awesome Remote Job
+
+> A curated, actively-maintained list of remote job boards, companies with genuine "remote DNA," relocation and visa resources, and tools for building a remote working career. Every entry is vetted for quality — no paywalls, no forced logins — and dead links are checked on every change.
+
+## Core Sections
+
+- [FAQ](https://github.com/sheepdontmoo/awesome-remote-job/blob/master/README.md#faq): Direct answers on finding legitimate remote jobs and identifying remote-first companies.
+- [Job boards](https://github.com/sheepdontmoo/awesome-remote-job/blob/master/README.md#job-boards): Vetted remote job boards without paywalls or forced logins.
+- [Job boards aggregators](https://github.com/sheepdontmoo/awesome-remote-job/blob/master/README.md#job-boards-aggregators): Sites that aggregate listings across multiple remote job boards.
+- [Companies with "remote DNA"](https://github.com/sheepdontmoo/awesome-remote-job/blob/master/README.md#companies-with-remote-dna): Companies built around remote work as a core practice, not just remote-friendly.
+- [Interviewing](https://github.com/sheepdontmoo/awesome-remote-job/blob/master/README.md#interviewing): Resources for interviewing successfully for remote roles.
+
+## Practical Resources
+
+- [Housing](https://github.com/sheepdontmoo/awesome-remote-job/blob/master/README.md#housing)
+- [Relocation Incentives](https://github.com/sheepdontmoo/awesome-remote-job/blob/master/README.md#relocation-incentives)
+- [Law & Finance](https://github.com/sheepdontmoo/awesome-remote-job/blob/master/README.md#law--finance)
+- [Tools](https://github.com/sheepdontmoo/awesome-remote-job/blob/master/README.md#tools)
+
+## Optional
+
+- [Articles & Posts](https://github.com/sheepdontmoo/awesome-remote-job/blob/master/README.md#articles--posts)
+- [Videos](https://github.com/sheepdontmoo/awesome-remote-job/blob/master/README.md#videos)
+- [Books](https://github.com/sheepdontmoo/awesome-remote-job/blob/master/README.md#books)
+- [Podcasts](https://github.com/sheepdontmoo/awesome-remote-job/blob/master/README.md#podcasts)
+- [Newsletters](https://github.com/sheepdontmoo/awesome-remote-job/blob/master/README.md#newsletters)
+- [Communities](https://github.com/sheepdontmoo/awesome-remote-job/blob/master/README.md#communities)
+- [Conferences](https://github.com/sheepdontmoo/awesome-remote-job/blob/master/README.md#conferences)
