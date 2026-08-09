@@ -191,13 +191,57 @@ class PeriodicityTests(unittest.TestCase):
     def test_hourly_bars_imply_a_five_day_trading_year(self) -> None:
         self.assertAlmostEqual(infer_periods_per_year(curve([10_000] * 50)), 252.0 * 24.0, places=6)
 
-    def test_daily_bars_imply_252_periods(self) -> None:
-        points = curve([10_000] * 50, minutes=60 * 24)
-        self.assertAlmostEqual(infer_periods_per_year(points), 252.0, places=6)
+    def test_weekday_daily_bars_imply_about_252_periods(self) -> None:
+        # A real daily forex series has no Saturday or Sunday bar, so a year of
+        # it holds ~261 points. The count comes out of the data rather than out
+        # of an assumed session length.
+        points = []
+        stamp = START
+        equities = []
+        while len(points) < 400:
+            if stamp.weekday() < 5:
+                points.append(stamp)
+                equities.append(10_000)
+            stamp += timedelta(days=1)
+        built = [
+            EquityPoint(ts=t, equity=e, balance=e, exposure_lots=0.0, drawdown=0.0)
+            for t, e in zip(points, equities)
+        ]
+        self.assertAlmostEqual(infer_periods_per_year(built), 261.0, delta=3.0)
 
-    def test_the_median_gap_is_used_so_weekends_do_not_deflate_it(self) -> None:
+    def test_a_seven_day_daily_series_is_counted_as_seven_days(self) -> None:
+        # Crypto CFDs really do print a bar every calendar day. Asserting 252
+        # here would be asserting an assumption over the data.
+        points = curve([10_000] * 400, minutes=60 * 24)
+        self.assertAlmostEqual(infer_periods_per_year(points), 365.25, delta=2.0)
+
+    def test_a_session_traded_series_is_not_credited_with_a_24_hour_day(self) -> None:
+        # The audit's case: 6.5-hour cash-index session, hourly bars. Dividing a
+        # trading year by the median gap claims 6,048 periods a year and
+        # inflates Sharpe ~1.9x; counting gives the truth.
+        points = []
+        stamp = START.replace(hour=14, minute=30)
+        day = 0
+        while len(points) < 1638:
+            if stamp.weekday() < 5:
+                for hour in range(7):
+                    points.append(stamp + timedelta(hours=hour))
+                    if len(points) >= 1638:
+                        break
+            day += 1
+            stamp = START.replace(hour=14, minute=30) + timedelta(days=day)
+        built = [
+            EquityPoint(ts=t, equity=10_000, balance=10_000, exposure_lots=0.0, drawdown=0.0)
+            for t in points
+        ]
+        inferred = infer_periods_per_year(built)
+        self.assertLess(inferred, 2_500.0, f"inferred {inferred:.0f}, the old code said 6048")
+        self.assertGreater(inferred, 1_200.0)
+
+    def test_a_short_curve_falls_back_to_the_median_gap(self) -> None:
+        # Under a fortnight the span is dominated by whichever weekend lands in
+        # it, so counting would be noise; the median spacing is used instead.
         points = list(curve([10_000] * 40))
-        # Insert a 48-hour hole; the median hourly spacing must survive it.
         tail = [
             EquityPoint(ts=p.ts + timedelta(hours=48), equity=p.equity, balance=p.balance,
                         exposure_lots=0.0, drawdown=0.0)

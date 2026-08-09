@@ -404,5 +404,153 @@ class WidenedStopTests(unittest.TestCase):
         self.assertFalse(any("widened" in w for w in result.warnings))
 
 
+class AnnualisationTests(unittest.TestCase):
+    """`infer_periods_per_year` divided a trading year by the median bar gap,
+    which credits every instrument with a 24-hour day. A 6.5-hour cash-index
+    session was scored as 6,048 hourly periods a year against a true 1,638,
+    inflating Sharpe ~1.9x and CAGR ~4x on every session-traded CFD - and the
+    report then told the reader the sample covered 0.27 of a year when it
+    covered a full one."""
+
+    @staticmethod
+    def _session_curve(n_bars: int, hours_per_day: int):
+        from tradelab.types import EquityPoint
+
+        points = []
+        day = 0
+        while len(points) < n_bars:
+            stamp = START + timedelta(days=day)
+            if stamp.weekday() < 5:
+                for hour in range(hours_per_day):
+                    points.append(EquityPoint(
+                        ts=stamp + timedelta(hours=hour), equity=10_000.0,
+                        balance=10_000.0, exposure_lots=0.0, drawdown=0.0,
+                    ))
+                    if len(points) >= n_bars:
+                        break
+            day += 1
+        return points
+
+    def test_a_session_traded_series_is_counted_not_assumed(self) -> None:
+        from tradelab.metrics import infer_periods_per_year
+
+        curve = self._session_curve(1638, hours_per_day=7)
+        inferred = infer_periods_per_year(curve)
+        self.assertLess(inferred, 2_500.0, f"got {inferred:.0f}; the old code said 6048")
+
+    def test_a_round_the_clock_series_still_lands_near_its_true_density(self) -> None:
+        from tradelab.metrics import infer_periods_per_year
+
+        curve = self._session_curve(4000, hours_per_day=24)
+        self.assertGreater(infer_periods_per_year(curve), 5_000.0)
+
+    def test_calendar_span_drives_the_year_count(self) -> None:
+        from tradelab.metrics import span_years
+
+        curve = self._session_curve(1638, hours_per_day=7)
+        self.assertAlmostEqual(span_years(curve), 1.0, delta=0.15)
+
+
+class CaveatSurvivesTotalRuinTests(unittest.TestCase):
+    """`caveats()` divided by `1 - max_drawdown` with no guard: nonsense text
+    above 100% and ZeroDivisionError at exactly 100%, taking down the section
+    the report deliberately ends on."""
+
+    def test_a_hundred_percent_drawdown_does_not_raise(self) -> None:
+        from tradelab.metrics import Metrics
+
+        text = " ".join(Metrics(max_drawdown=1.0, n_trades=5).caveats())
+        self.assertIn("wiped out", text)
+
+    def test_beyond_total_ruin_reports_no_recovery_multiple(self) -> None:
+        from tradelab.metrics import Metrics
+
+        text = " ".join(Metrics(max_drawdown=1.5012, n_trades=5).caveats())
+        self.assertNotIn("-300%", text)
+        self.assertIn("wiped out", text)
+
+
+class DeflatedSharpeTests(unittest.TestCase):
+    """The CLI passed `int(round(years))` clamped to 2, so on any sample under
+    ~1.5 years the haircut was a constant that exceeded every Sharpe - the
+    "searching this many configurations would produce this anyway" verdict was
+    guaranteed output rather than a finding."""
+
+    def test_fractional_years_are_not_rounded_away(self) -> None:
+        from tradelab.validation import deflated_sharpe
+
+        at_1_4 = deflated_sharpe(1.5, n_trials=9, n_obs=1.4)
+        at_2_0 = deflated_sharpe(1.5, n_trials=9, n_obs=2.0)
+        self.assertNotAlmostEqual(at_1_4, at_2_0, places=3)
+        self.assertLess(at_1_4, at_2_0)  # less history, deeper haircut
+
+    def test_a_span_too_short_to_deflate_is_refused_not_clamped(self) -> None:
+        from tradelab.validation import deflated_sharpe
+
+        with self.assertRaises(ValueError):
+            deflated_sharpe(1.5, n_trials=9, n_obs=1.0)
+
+    def test_more_history_haircuts_less(self) -> None:
+        from tradelab.validation import deflated_sharpe
+
+        values = [deflated_sharpe(1.5, n_trials=9, n_obs=y) for y in (1.5, 3.0, 10.0)]
+        self.assertEqual(values, sorted(values))
+
+
+class GridMedianTests(unittest.TestCase):
+    """The sensitivity "grid median" was the median of the cells that scored,
+    not of the grid - the search's own survivors answering the one question
+    that exists to describe the counterfactual without the search."""
+
+    def test_unscoreable_cells_count_as_zero_in_the_median(self) -> None:
+        from tradelab.data import synthetic_trending
+        from tradelab.strategies import DonchianBreakout
+        from tradelab.validation import grid, parameter_sensitivity
+
+        cells = grid(entry_lookback=[5, 10, 20, 40, 80], exit_lookback=[3, 5, 10])
+        result = parameter_sensitivity(
+            lambda p: DonchianBreakout(**p), cells,
+            synthetic_trending(700, seed=1), lambda: Backtester(),
+        )
+        if result.n_scored < result.n_cells:
+            import statistics as _stats
+            survivors = _stats.median(
+                [c.objective for c in result.cells if c.scored]
+            )
+            self.assertNotAlmostEqual(result.median_objective, survivors, places=6)
+        self.assertTrue(math_isfinite(result.median_objective))
+
+
+class WalkForwardHonestyTests(unittest.TestCase):
+    """Unscoreable test folds were folded to 0.0 and then narrated as measured:
+    "the sign flipped once the data was unseen" printed about five folds none of
+    which took enough trades to be scored at all."""
+
+    def test_a_run_where_no_fold_scores_says_so(self) -> None:
+        from tradelab.data import synthetic_random_walk
+        from tradelab.strategies import DonchianBreakout
+        from tradelab.validation import grid, walk_forward
+
+        result = walk_forward(
+            lambda p: DonchianBreakout(**p),
+            grid(entry_lookback=[60, 80], exit_lookback=[20]),
+            synthetic_random_walk(700, seed=4),
+            lambda: Backtester(),
+            n_folds=5,
+        )
+        self.assertLessEqual(result.folds_scored, result.n_folds)
+        if result.folds_scored == 0:
+            self.assertIn("not one of the", result.verdict)
+            self.assertIn("placeholder", result.verdict)
+        elif result.folds_scored < result.n_folds:
+            self.assertIn("could be scored", result.verdict)
+
+
+def math_isfinite(value: float) -> bool:
+    import math
+
+    return math.isfinite(value)
+
+
 if __name__ == "__main__":
     unittest.main()

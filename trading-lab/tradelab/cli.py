@@ -41,7 +41,7 @@ from typing import Optional, Sequence
 
 from .data import DataError, load_csv, load_mt5_csv, summary, synthetic_random_walk, synthetic_trending
 from .engine import Backtester
-from .metrics import summarize
+from .metrics import span_years, summarize
 from .report import render_comparison, render_report, render_validation
 from .strategies import REGISTRY
 from .strategy import Strategy
@@ -349,12 +349,23 @@ class _Sweep:
     n_cells: int
     n_scored: int
     best_params: str
+    # The winning cell's trade count travels with it. Without it `validate`
+    # could report a p-value, a degradation ratio and a drawdown distribution
+    # about a twelve-trade sample and never once say how many trades that was.
+    best_trades: int
     best_objective: float
     median_objective: float
     profitable_fraction: float
     plateau_score: float
     n_neighbours: int
     verdict: str
+
+
+@dataclass(frozen=True)
+class _Caveats:
+    """The winning cell's own caveats, so `validate` ends the way `run` does."""
+
+    caveats: list
 
 
 @dataclass(frozen=True)
@@ -450,6 +461,10 @@ def cmd_validate(args: argparse.Namespace, stream) -> int:
     if forward is not None:
         records.append(forward)
     records.extend([permutation, monte_carlo, deflation, baseline])
+    # `run` argues with the user through Metrics.caveats(); `validate` is the
+    # command whose entire purpose is deciding whether to believe the number,
+    # and it used to be the one that never mentioned a thin sample at all.
+    records.append(_Caveats(caveats=sensitivity.best.metrics.caveats()))
 
     print(file=stream)
     print(render_validation(*records, width=width), file=stream)
@@ -462,6 +477,7 @@ def _summarise_sweep(sensitivity) -> _Sweep:
         n_cells=sensitivity.n_cells,
         n_scored=sensitivity.n_scored,
         best_params=", ".join(f"{k}={v}" for k, v in sorted(params.items())) or "(defaults)",
+        best_trades=sensitivity.best.trades,
         best_objective=sensitivity.best_objective,
         median_objective=sensitivity.median_objective,
         profitable_fraction=sensitivity.profitable_fraction,
@@ -499,22 +515,34 @@ def _deflate(result, metrics, n_trials: int) -> _Deflation:
     difference between a result that survives the search and one that does not.
     """
     sharpe = metrics.sharpe
-    ppy = metrics.periods_per_year
-    years = (len(result.equity_curve) / ppy) if ppy else None
-    if sharpe is None or years is None or years < 2.0 / 12.0:
+    years = span_years(result.equity_curve)
+    # A shade over one year is the real floor. The standard error behind the
+    # haircut carries a 1/(n_obs - 1) term, so under one year of returns it is
+    # not merely imprecise, it is undefined; and clamping a fractional year up
+    # to 2 - which is what rounding used to do - made the haircut exceed any
+    # Sharpe whatsoever. Every sample shorter than ~1.5 years then printed
+    # "at or below zero after the haircut" as a guaranteed result, dressed as
+    # a finding about the strategy.
+    if sharpe is None or years is None or years <= 1.05:
         return _Deflation(
             observed_sharpe=sharpe,
             n_trials=n_trials,
             n_years=years,
             deflated_sharpe=None,
             verdict=(
-                "not enough of a sample to deflate: an annualised Sharpe has to be "
-                "haircut against the number of years of returns behind it, and this "
-                "run does not have a usable span. Read the sweep and the walk-forward "
-                "instead."
+                f"not enough of a sample to deflate: an annualised Sharpe is haircut "
+                f"against the number of *years* of returns behind it, and this run spans "
+                f"{years:.2f}. " if years else "not enough of a sample to deflate. "
+            ) + (
+                "Under about a year the standard error the haircut rests on is not "
+                "defined, so no number here would mean anything. Read the sweep, the "
+                "walk-forward and the null benchmark instead, and come back to this "
+                "with more history."
             ),
         )
-    value = deflated_sharpe(float(sharpe), n_trials=max(1, n_trials), n_obs=max(2, int(round(years))))
+    # Fractional years, not a rounded integer: at years=1.4 the rounding used
+    # to report -0.72 where the true span gives -2.01.
+    value = deflated_sharpe(float(sharpe), n_trials=max(1, n_trials), n_obs=float(years))
     if value > 0.0:
         tail = (
             "still positive after the haircut, which means the search alone does not "

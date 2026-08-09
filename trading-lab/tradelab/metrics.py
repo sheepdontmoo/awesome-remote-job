@@ -26,10 +26,17 @@ Conventions
   paying a non-trivial yield this flatters an intraday strategy that holds no
   overnight risk, and it understates nothing. Adjust mentally, or subtract the
   bill rate from the returns before you compare against a benchmark.
-* Annualisation assumes a **5-day forex week**: 252 trading days of 24 hours,
-  not 365 calendar days. Hourly bars therefore imply ~6048 periods per year.
-  Annualising 24-hour bars as if there were 365 of them a year overstates the
-  period count by ~45% and the Sharpe by ~20%.
+* **Annualisation is counted, not assumed.** `periods_per_year` is the number
+  of equity-curve observations divided by the calendar years they span, so a
+  24/5 forex hourly series lands near 6,000 and a 6.5-hour cash-index session
+  lands near 1,600 without anyone configuring anything. Deriving it instead
+  from the median bar gap - the obvious approach, and the one this used to
+  take - credits every instrument with a 24-hour day and inflates Sharpe by
+  ~1.9x and CAGR by ~4x on anything session-traded.
+* CAGR and `trades_per_year` are per **calendar** year, because that is the
+  unit a person waits through. Sharpe and Sortino annualise by
+  `sqrt(periods_per_year)` on the observation count, which is the correct
+  basis for a volatility scaling.
 * Everything derived from an equity curve is derived from *equity*, not
   balance, so open-position mark-to-market counts against the drawdown. That is
   what an account statement and a margin call both use.
@@ -57,6 +64,9 @@ from .types import BacktestResult, EquityPoint, Instrument, Trade
 # the two never disagree about anything that matters.
 _TRADING_DAYS_PER_YEAR = 252.0
 _SECONDS_PER_TRADING_YEAR = _TRADING_DAYS_PER_YEAR * 24.0 * 3600.0
+# Calendar years are what a person actually waits through, so CAGR and
+# trades-per-year are measured in them rather than in trading time.
+_SECONDS_PER_CALENDAR_YEAR = 365.25 * 24.0 * 3600.0
 _SECONDS_PER_DAY = 86400.0
 # Wall-clock spans include weekends; trading time does not. 5/7 converts one to
 # the other when only timestamps are available (the trades-only path).
@@ -85,7 +95,7 @@ class Metrics:
 
     # -- returns ----------------------------------------------------------
     total_return: Optional[float] = None      # fraction, final/initial - 1
-    cagr: Optional[float] = None              # annualised, trading-time years
+    cagr: Optional[float] = None              # annualised over calendar years
     final_equity: float = 0.0
     net_pnl: float = 0.0                      # after every cost
     gross_pnl: float = 0.0                    # what a naive backtest reports
@@ -205,13 +215,27 @@ class Metrics:
             )
 
         if self.max_drawdown > _SEVERE_DRAWDOWN:
-            out.append(
+            head = (
                 f"Peak-to-trough drawdown of {self.max_drawdown * 100:.0f}% "
-                f"({self.max_drawdown_cash:,.0f} in account currency). Recovering "
-                "from that requires a "
-                f"{(1.0 / (1.0 - self.max_drawdown) - 1.0) * 100:.0f}% gain, and "
-                "it happened on the sample the rules were chosen against."
+                f"({self.max_drawdown_cash:,.0f} in account currency). "
             )
+            # A drawdown of 100% or more has no recovery multiple - the account
+            # reached zero or went through it. Dividing by (1 - dd) here raised
+            # ZeroDivisionError at exactly 100% and printed a negative "required
+            # gain" beyond it, taking down the section the report ends on.
+            if self.max_drawdown >= 1.0:
+                out.append(
+                    head + "The account was wiped out. There is no gain that "
+                    "recovers this, and any statistic above describing what "
+                    "happened afterwards is arithmetic on an account that no "
+                    "longer existed."
+                )
+            else:
+                out.append(
+                    head + "Recovering from that requires a "
+                    f"{(1.0 / (1.0 - self.max_drawdown) - 1.0) * 100:.0f}% gain, and "
+                    "it happened on the sample the rules were chosen against."
+                )
 
         if self.n_trades > 0 and self.profit_factor is None:
             out.append(
@@ -270,30 +294,54 @@ class Metrics:
 
 
 def infer_periods_per_year(equity_curve: Sequence[EquityPoint]) -> float:
-    """Periods per year implied by the spacing of the equity curve.
+    """Observations per calendar year, counted rather than assumed.
 
-    Uses the **median** gap, not the mean. Forex data has a 48-hour hole every
-    weekend and assorted holiday gaps; the mean gap is dragged upward by them
-    and would under-count the periods in a year, quietly deflating Sharpe. The
-    median reports the bar size the data was actually sampled at.
+    This is simply `observations / calendar years spanned`. It needs no
+    assumption about how long a session is or how many days a week trade,
+    because the curve already knows both: it has one point per bar, and it
+    knows when it started and finished.
 
-    A trading year here is 252 days of 24 hours - a 5-day week - so hourly bars
-    give ~6048 and daily bars give 252. Falls back to 252 when there is not
-    enough of a curve to measure.
+    The obvious-looking alternative - divide a "trading year" by the median bar
+    gap - is what this used to do, and it is wrong for anything that does not
+    trade around the clock. The median gap gives the *sampling interval*, not
+    how many of those intervals exist in a year, so a 6.5-hour cash-index
+    session was credited with 24 hours of hourly bars a day: 6,048 periods a
+    year against a true 1,638. That inflated Sharpe by ~1.9x and CAGR by ~4x on
+    every session-traded CFD, silently, with no caveat mentioning the basis.
+
+    Falls back to 252 when there is not enough curve to measure.
+    """
+    if len(equity_curve) < 3:
+        return _TRADING_DAYS_PER_YEAR
+    span = (equity_curve[-1].ts - equity_curve[0].ts).total_seconds()
+    if span <= 0.0:
+        return _TRADING_DAYS_PER_YEAR
+    observations = len(equity_curve) - 1
+    per_year = observations * _SECONDS_PER_CALENDAR_YEAR / span
+    # A curve shorter than a few weeks cannot pin this down - the span is
+    # dominated by whichever weekend happens to fall inside it - so fall back
+    # rather than annualise from a handful of bars.
+    if span < 14.0 * 24.0 * 3600.0:
+        gaps = [
+            (equity_curve[i].ts - equity_curve[i - 1].ts).total_seconds()
+            for i in range(1, len(equity_curve))
+        ]
+        positive = [g for g in gaps if g > 0.0]
+        if positive:
+            return _SECONDS_PER_TRADING_YEAR / statistics.median(positive)
+    return per_year
+
+
+def span_years(equity_curve: Sequence[EquityPoint]) -> Optional[float]:
+    """Calendar years between the first and last point of the curve.
+
+    Used for CAGR and for `trades_per_year`, both of which are per *calendar*
+    year - the unit a person actually waits through - not per trading year.
     """
     if len(equity_curve) < 2:
-        return _TRADING_DAYS_PER_YEAR
-    gaps = [
-        (equity_curve[i].ts - equity_curve[i - 1].ts).total_seconds()
-        for i in range(1, len(equity_curve))
-    ]
-    positive = [g for g in gaps if g > 0.0]
-    if not positive:
-        return _TRADING_DAYS_PER_YEAR
-    median_gap = statistics.median(positive)
-    if median_gap <= 0.0:
-        return _TRADING_DAYS_PER_YEAR
-    return _SECONDS_PER_TRADING_YEAR / median_gap
+        return None
+    span = (equity_curve[-1].ts - equity_curve[0].ts).total_seconds()
+    return span / _SECONDS_PER_CALENDAR_YEAR if span > 0.0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -565,7 +613,10 @@ def summarize(result: BacktestResult, periods_per_year: Optional[float] = None) 
     path = [(p.ts, p.equity) for p in curve]
     under = _underwater(path, initial)
 
-    years: Optional[float] = (len(curve) / ppy) if curve and ppy > 0.0 else None
+    # Calendar years off the clock, not bar-count divided by an assumed
+    # periods-per-year. Deriving it from ppy propagated any error in the
+    # annualisation basis straight into CAGR and trades_per_year.
+    years: Optional[float] = span_years(curve)
     cagr = _cagr(initial, final, years)
 
     fields = _trade_block(result.trades, result.instrument, years)

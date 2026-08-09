@@ -232,6 +232,10 @@ class WalkForwardResult:
     out_of_sample_net_pnl: float
     out_of_sample_trades: int
     folds_positive: int
+    # Test folds that produced a real measurement. Anything less than n_folds
+    # means the mean above is partly made of zeros standing in for "could not
+    # run", which is not the same as a zero result.
+    folds_scored: int
     verdict: str
     warnings: list[str] = field(default_factory=list)
 
@@ -322,6 +326,13 @@ def walk_forward(
     degradation = out_sample / in_sample if in_sample > 0 else float("nan")
     oos_trades = sum(len(f.test_result.trades) for f in folds)
     positive = sum(1 for f in folds if f.test_result.net_pnl > 0)
+    # How many test folds produced a real measurement. Folding an unscoreable
+    # fold to 0.0 for the mean is defensible; letting the verdict then describe
+    # that 0.0 as "the sign flipped once the data was unseen" is not, because
+    # nothing flipped - nothing was measured. The per-fold trade guard is what
+    # the summed one at `oos_trades` misses: five folds of four trades each sum
+    # to twenty and pass, while not one of them could be scored.
+    folds_scored = sum(1 for f in folds if math.isfinite(f.test_objective))
 
     return WalkForwardResult(
         folds=folds,
@@ -333,8 +344,9 @@ def walk_forward(
         out_of_sample_net_pnl=sum(f.test_result.net_pnl for f in folds),
         out_of_sample_trades=oos_trades,
         folds_positive=positive,
+        folds_scored=folds_scored,
         verdict=_walk_forward_verdict(
-            in_sample, out_sample, degradation, positive, len(folds), oos_trades
+            in_sample, out_sample, degradation, positive, len(folds), oos_trades, folds_scored
         ),
         warnings=warnings,
     )
@@ -347,8 +359,20 @@ def _walk_forward_verdict(
     positive: int,
     n_folds: int,
     oos_trades: int,
+    folds_scored: int,
 ) -> str:
     tail = f"{positive} of {n_folds} folds profitable out of sample"
+    if folds_scored == 0:
+        return (
+            f"not one of the {n_folds} test folds took enough trades to be scored, so there "
+            f"is no out-of-sample result here at all - the objective of 0.00 above is a "
+            f"placeholder, not a measurement. Use fewer folds or more data"
+        )
+    if folds_scored < n_folds:
+        tail += (
+            f" (only {folds_scored} of {n_folds} test folds could be scored; the rest "
+            f"count as zero in the mean)"
+        )
     if oos_trades < MIN_TRADES:
         return (
             f"only {oos_trades} out-of-sample trades across {n_folds} folds - too few to "
@@ -425,12 +449,22 @@ def monte_carlo_drawdown(
     strategy whose realised drawdown sits at the 20th percentile did not have
     a shallow drawdown; it had a lucky order.
 
-    Two limitations worth stating rather than burying. Trade P&L is taken as
+    Three limitations worth stating rather than burying. Trade P&L is taken as
     realised, so reordering does not re-size later trades the way percentage
     risk actually would - real compounding makes good sequences better and bad
-    ones worse than this shows. And the bootstrap assumes trades are
-    independent, which destroys any streakiness the strategy really has; if
-    losses cluster in reality, the true tail is worse than the p99 here.
+    ones worse than this shows. The bootstrap assumes trades are independent,
+    which destroys any streakiness the strategy really has; if losses cluster
+    in reality, the true tail is worse than the p99 here.
+
+    And the third, which is the one that makes every number here a floor: this
+    is a ladder of **closed** P&L. It steps once per trade and never marks an
+    open position to market, so no path in the distribution contains any
+    intra-trade excursion. The account's own curve dips lower than any of them.
+    `observed_max_drawdown` is therefore not the drawdown the account lived
+    through - `curve_max_drawdown`, carried alongside it, is - and `p95`, `p99`
+    and `prob_ruin` are all lower bounds rather than estimates. The gap is
+    small for tight-stop systems and unbounded for anything that holds through
+    an excursion.
     """
     pnls = [t.net_pnl for t in result.trades]
     start = float(result.initial_equity)
@@ -817,7 +851,13 @@ def parameter_sensitivity(
     scored = [c for c in cells if c.scored]
     best = max(cells, key=lambda c: (c.objective, c.net_pnl))
     profitable = sum(1 for c in cells if c.net_pnl > 0.0) / len(cells)
-    median = statistics.median([c.objective for c in scored]) if scored else float("nan")
+    # Over the WHOLE grid, with unscoreable cells folded to zero - the same
+    # policy the plateau score below uses and the one the module docstring
+    # states. Taking the median over survivors instead answers "what did the
+    # cells that worked score?", which is the search's own selection speaking,
+    # and this number exists precisely to say what a cell picked without the
+    # search would have scored.
+    median = statistics.median([_score(c.objective) for c in cells])
 
     neighbours = _neighbours(cells, best)
     if neighbours and math.isfinite(best.objective) and best.objective > 0.0:
@@ -925,7 +965,7 @@ _EULER_MASCHERONI = 0.5772156649015329
 def deflated_sharpe(
     observed_sharpe: float,
     n_trials: int,
-    n_obs: int,
+    n_obs: float,
     skew: float = 0.0,
     kurtosis: float = 3.0,
 ) -> float:
@@ -972,8 +1012,13 @@ def deflated_sharpe(
     """
     if n_trials < 1:
         raise ValueError("n_trials must be at least 1")
-    if n_obs < 2:
-        raise ValueError("n_obs must be at least 2 for a Sharpe standard error to exist")
+    if n_obs <= 1.0:
+        raise ValueError(
+            "n_obs must exceed 1 for a Sharpe standard error to exist; it is a "
+            "count of return observations at the frequency observed_sharpe is "
+            "expressed in, and it is deliberately a float so that a fractional "
+            "year is not silently rounded up to a usable sample"
+        )
 
     variance_term = 1.0 - skew * observed_sharpe + (kurtosis - 1.0) / 4.0 * observed_sharpe ** 2
     # The term is positive for any plausible moment set; clamp rather than
