@@ -344,7 +344,12 @@ class ExecutionTests(unittest.TestCase):
         point = Instrument().point
         self.assertAlmostEqual(trade.entry_price, 1.10000 - 2.5 * point, places=9)
         self.assertAlmostEqual(trade.exit_price, 1.10000 + 2.5 * point, places=9)
-        self.assertLess(trade.gross_pnl, 0.0)
+        # Price never moved, so the costless result is exactly zero and the
+        # whole loss is the round turn: 1.0 point of spread and 4.0 of slippage.
+        self.assertAlmostEqual(trade.gross_pnl, 0.0, places=9)
+        self.assertAlmostEqual(trade.spread_cost, 1.00, places=9)
+        self.assertAlmostEqual(trade.slippage_cost, 4.00, places=9)
+        self.assertAlmostEqual(trade.net_pnl, -5.00, places=9)
 
 
 class SizingTests(unittest.TestCase):

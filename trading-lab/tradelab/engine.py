@@ -83,6 +83,10 @@ class _OpenPosition:
     lots: float
     entry_ts: datetime
     entry_price: float
+    # The bar's own price at entry, before spread and slippage moved the fill.
+    # Gross P&L is measured from here so that the cost fields below can be
+    # charged once rather than being buried in the fill and subtracted again.
+    entry_mid: float
     stop_loss: Optional[float]
     take_profit: Optional[float]
     initial_stop: Optional[float]
@@ -140,14 +144,27 @@ class Backtester:
             if self._position is not None and prev_ts is not None:
                 self._charge_swap(prev_ts, bar.ts)
 
-            # 2. Protective exits, checked against this bar's OHLC.
+            # 2. Protective exits, checked against this bar's OHLC. Excursions
+            # are recorded first: every exit path clears the position, so
+            # measuring afterwards would skip the bar a trade was stopped out
+            # on - which is, by construction, its worst bar.
             if self._position is not None:
+                self._update_excursions(bar)
                 self._check_protective_exit(bar)
 
             # 3. The intent formed at the close of bar i-1, filled at this open.
             if self._pending is not None:
                 intent, self._pending = self._pending, None
                 self._execute_intent(intent, bar)
+                # A position opened at this bar's open then lived through the
+                # rest of this bar, so its stop and target have to be checked
+                # against this bar's range too. Letting them go live only on the
+                # next bar backtests a tight stop as though it were not there:
+                # the tighter the stop relative to a bar's range, the more of
+                # the equity curve is manufactured by the hole.
+                if self._position is not None and self._position.entry_ts == bar.ts:
+                    self._update_excursions(bar)
+                    self._check_protective_exit(bar, from_open=False)
 
             # 4. Mark to market: age the position and record its excursions.
             if self._position is not None:
@@ -231,11 +248,17 @@ class Backtester:
     def _unrealized(self, price: float) -> float:
         """Open-position P&L at `price`: mark plus accrued swap, minus the
         entry leg's costs. Exit costs are not guessed at - they are charged
-        when the exit actually happens."""
+        when the exit actually happens.
+
+        The mark runs from `entry_mid`, not from the fill. Running it from the
+        fill would subtract the entry spread and slippage a second time, and
+        mark a position down by twice its entry costs the instant it opens -
+        which flows straight into drawdown, Ulcer and Sharpe.
+        """
         pos = self._position
         if pos is None:
             return 0.0
-        move = (price - pos.entry_price) * int(pos.direction)
+        move = (price - pos.entry_mid) * int(pos.direction)
         gross = move * pos.lots * self.instrument.contract_size
         return gross + pos.swap - pos.commission - pos.spread_cost - pos.slippage_cost
 
@@ -279,8 +302,14 @@ class Backtester:
 
     # -- exits ------------------------------------------------------------
 
-    def _check_protective_exit(self, bar: Bar) -> None:
-        """Fill the stop or the target if this bar could have touched either."""
+    def _check_protective_exit(self, bar: Bar, *, from_open: bool = True) -> None:
+        """Fill the stop or the target if this bar could have touched either.
+
+        `from_open=False` is used for a position opened at this bar's own open.
+        The gap branches below are skipped in that case: the account has just
+        dealt at that open, so it cannot also have gapped through a level on
+        the way to it. Only the intrabar range applies.
+        """
         pos = self._position
         assert pos is not None
         stop, target = pos.stop_loss, pos.take_profit
@@ -289,13 +318,14 @@ class Backtester:
 
         # The open is the first price the account could have dealt at, so gaps
         # are resolved before anything that happened later in the bar.
-        if stop is not None and ((long and bar.open <= stop) or (not long and bar.open >= stop)):
-            self._close_position(bar.open, bar.ts, stop_reason)
-            return
-        if target is not None and ((long and bar.open >= target) or (not long and bar.open <= target)):
-            # Filled at the limit, never at the better gapped open.
-            self._close_position(target, bar.ts, ExitReason.TAKE_PROFIT, is_limit=True)
-            return
+        if from_open:
+            if stop is not None and ((long and bar.open <= stop) or (not long and bar.open >= stop)):
+                self._close_position(bar.open, bar.ts, stop_reason)
+                return
+            if target is not None and ((long and bar.open >= target) or (not long and bar.open <= target)):
+                # Filled at the limit, never at the better gapped open.
+                self._close_position(target, bar.ts, ExitReason.TAKE_PROFIT, is_limit=True)
+                return
 
         stop_hit = stop is not None and ((long and bar.low <= stop) or (not long and bar.high >= stop))
         target_hit = target is not None and ((long and bar.high >= target) or (not long and bar.low <= target))
@@ -319,7 +349,9 @@ class Backtester:
             return
         buying = pos.direction == Direction.SHORT  # closing a short is a buy
         fill = self.cost_model.fill(mid, buying, is_limit=is_limit)
-        move = (fill.price - pos.entry_price) * int(pos.direction)
+        # Measured mid-to-mid, so the cost fields on the Trade are charged once
+        # each instead of also being embedded in the two fill prices.
+        move = (mid - pos.entry_mid) * int(pos.direction)
         trade = Trade(
             direction=pos.direction,
             lots=pos.lots,
@@ -360,6 +392,22 @@ class Backtester:
                 # re-enter the same trade is a cost with no economic content, so
                 # the intent is read as an update to the protective levels.
                 if intent.stop_loss is not None:
+                    # A widened stop is allowed - a strategy may have reason -
+                    # but the risk it reports must follow it. `initial_stop`
+                    # tracks the *widest* stop the trade ever carried, so an
+                    # R-multiple is measured against the risk that was really
+                    # taken rather than against the tighter one it started
+                    # with. Silently keeping the original scales every
+                    # R-multiple, expectancy_r and best/worst-R by a factor
+                    # nothing recorded.
+                    if pos.initial_stop is not None and _widens(
+                        pos.direction, pos.entry_mid, pos.initial_stop, intent.stop_loss
+                    ):
+                        self._warn(
+                            f"{_stamp(bar.ts)}: stop widened from {pos.initial_stop:.5f} to "
+                            f"{intent.stop_loss:.5f}; risk is now measured against the wider one"
+                        )
+                        pos.initial_stop = intent.stop_loss
                     pos.stop_loss = intent.stop_loss
                     pos.stop_moved = True
                 if intent.take_profit is not None:
@@ -385,6 +433,7 @@ class Backtester:
             lots=lots,
             entry_ts=bar.ts,
             entry_price=fill.price,
+            entry_mid=bar.open,
             stop_loss=intent.stop_loss,
             take_profit=intent.take_profit,
             initial_stop=intent.stop_loss,
@@ -426,14 +475,21 @@ class Backtester:
             )
             return 0.0
 
-        distance = abs(entry_price - stop)
-        stop_points = inst.points(distance)
-        if stop_points < self.risk.min_stop_points:
+        # Two different distances, on purpose. The guard asks the question the
+        # user configured - "is my stop at least N points from the price?" - so
+        # it measures from the bar, not from the fill, which sits a spread and a
+        # slippage further away and would quietly let a 47-point stop through a
+        # 50-point minimum. Sizing then uses the fill, because the cash the
+        # account actually puts at risk is the distance it will really travel.
+        quoted_points = inst.points(abs(bar.open - stop))
+        if quoted_points < self.risk.min_stop_points:
             self._warn(
-                f"{when}: trade skipped, stop is {stop_points:.1f} points away, inside the "
+                f"{when}: trade skipped, stop is {quoted_points:.1f} points away, inside the "
                 f"{self.risk.min_stop_points:.1f}-point minimum"
             )
             return 0.0
+        distance = abs(entry_price - stop)
+        stop_points = inst.points(distance)
 
         risk_cash = self._equity(bar.open) * self.risk.risk_per_trade
         lots = risk_cash / (distance * inst.contract_size)
@@ -449,16 +505,22 @@ class Backtester:
 
     def _update_excursions(self, bar: Bar) -> None:
         """Track how far the trade went against and in favour, in account
-        currency and gross of costs. Both are magnitudes: never negative."""
+        currency and gross of costs. Both are magnitudes: never negative.
+
+        Called twice per bar - once before the protective-exit check so a
+        stopped-out trade records the bar that stopped it, and once at the mark
+        so a position opened on this bar is not missed. `max` makes the overlap
+        harmless.
+        """
         pos = self._position
         assert pos is not None
         value = pos.lots * self.instrument.contract_size
         if pos.direction == Direction.LONG:
-            adverse = (pos.entry_price - bar.low) * value
-            favourable = (bar.high - pos.entry_price) * value
+            adverse = (pos.entry_mid - bar.low) * value
+            favourable = (bar.high - pos.entry_mid) * value
         else:
-            adverse = (bar.high - pos.entry_price) * value
-            favourable = (pos.entry_price - bar.low) * value
+            adverse = (bar.high - pos.entry_mid) * value
+            favourable = (pos.entry_mid - bar.low) * value
         pos.mae = max(pos.mae, adverse, 0.0)
         pos.mfe = max(pos.mfe, favourable, 0.0)
 
@@ -540,3 +602,12 @@ class Backtester:
 def _stamp(ts: datetime) -> str:
     """Timestamps in warnings are for a human reading a report, not for parsing."""
     return ts.strftime("%Y-%m-%d %H:%M")
+
+
+def _widens(direction: Direction, entry: float, old_stop: float, new_stop: float) -> bool:
+    """True when `new_stop` sits further from entry than `old_stop`, i.e. the
+    trade is being given more room and is therefore risking more."""
+    return abs(new_stop - entry) > abs(old_stop - entry) and (
+        (direction == Direction.LONG and new_stop < old_stop)
+        or (direction == Direction.SHORT and new_stop > old_stop)
+    )

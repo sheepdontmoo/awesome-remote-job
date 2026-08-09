@@ -111,13 +111,18 @@ class Instrument:
         return points * self.point
 
     def round_lots(self, lots: float) -> float:
-        """Snap a lot size down to a tradable size, or 0.0 if below the minimum."""
-        if lots < self.min_lot:
+        """Snap a lot size down to a tradable size, or 0.0 if below the minimum.
+
+        The cap is applied *before* the step flooring, not after. Capping last
+        would return `max_lot` itself even when it is not a whole number of
+        lot steps - a size the broker rejects.
+        """
+        capped = min(lots, self.max_lot)
+        if capped < self.min_lot:
             return 0.0
-        stepped = int(round(lots / self.lot_step + 1e-9)) * self.lot_step
-        if stepped > lots + 1e-12:
+        stepped = int(round(capped / self.lot_step + 1e-9)) * self.lot_step
+        if stepped > capped + 1e-12:
             stepped -= self.lot_step
-        stepped = min(stepped, self.max_lot)
         if stepped < self.min_lot:
             return 0.0
         return round(stepped, 8)
@@ -153,9 +158,12 @@ class CostConfig:
     rollover_hour_utc: int = 21
     price_is_mid: bool = True
 
-    def half_spread(self) -> float:
-        """Points added to (or subtracted from) mid to reach ask (or bid)."""
-        return self.spread_points / 2.0 if self.price_is_mid else 0.0
+    # How the spread splits across the two legs of a round turn depends on
+    # whether these bars are mid or bid, so it lives in `CostModel.spread_points`
+    # where both cases are handled together. There is deliberately no
+    # `half_spread()` helper here: the symmetric-half assumption it encoded is
+    # simply wrong for the bid-priced bars MetaTrader exports, and it charged
+    # nothing at all on them.
 
     def stress(self, factor: float) -> "CostConfig":
         """Return a copy with spread and slippage multiplied.
@@ -200,6 +208,13 @@ class Trade:
     `gross_pnl` is what a naive backtest would report. `net_pnl` is what
     would have landed in the account. The gap between them is the entire
     reason most published backtests do not survive live trading.
+
+    The two must be measured from different prices or the arithmetic
+    double-counts. `entry_price` and `exit_price` are the prices actually
+    dealt at, already moved against the trader by spread and slippage, while
+    `gross_pnl` is measured from the *reference* prices the bars printed. So
+    `gross_pnl` is the costless ideal, each cost field is charged exactly
+    once, and `net_pnl` lands back on the realised round turn.
     """
 
     direction: Direction

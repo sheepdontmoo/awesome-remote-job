@@ -45,7 +45,7 @@ from .metrics import summarize
 from .report import render_comparison, render_report, render_validation
 from .strategies import REGISTRY
 from .strategy import Strategy
-from .types import Bar, CostConfig, Instrument, RiskConfig
+from .types import CostConfig, Instrument, RiskConfig
 from .validation import (
     deflated_sharpe,
     grid,
@@ -337,6 +337,47 @@ def cmd_run(args: argparse.Namespace, stream) -> int:
 
 
 @dataclass(frozen=True)
+class _Sweep:
+    """The shape of the parameter surface, without the runs that produced it.
+
+    `SensitivityResult` carries every `BacktestResult` in the grid, which is the
+    right thing for a caller to inspect and the wrong thing to print: the
+    generic renderer would unfold thousands of equity points underneath a table
+    of nine numbers. Only the numbers travel to the report.
+    """
+
+    n_cells: int
+    n_scored: int
+    best_params: str
+    best_objective: float
+    median_objective: float
+    profitable_fraction: float
+    plateau_score: float
+    n_neighbours: int
+    verdict: str
+
+
+@dataclass(frozen=True)
+class _NullBenchmark:
+    """`null_benchmark`'s dict, given a type so the report can title it.
+
+    The renderer labels a bare mapping "RESULT", which is exactly the wrong
+    name for the block a reader is supposed to compare their strategy against.
+    """
+
+    n_runs: int
+    n_scored: int
+    median_objective: float
+    p5_objective: float
+    p95_objective: float
+    best_objective: float
+    median_net_pnl: float
+    median_trades: float
+    profitable_fraction: float
+    verdict: str
+
+
+@dataclass(frozen=True)
 class _Deflation:
     """The Sharpe of the best cell, minus what searching alone would produce."""
 
@@ -394,10 +435,18 @@ def cmd_validate(args: argparse.Namespace, stream) -> int:
     )
     best_result = sensitivity.best.result
     monte_carlo = monte_carlo_drawdown(best_result, n_runs=max(1, args.mc_runs))
-    baseline = null_benchmark(bars, backtester_factory, n_runs=max(1, args.null_runs))
+    baseline = _NullBenchmark(
+        **{
+            key: value
+            for key, value in null_benchmark(
+                bars, backtester_factory, n_runs=max(1, args.null_runs)
+            ).items()
+            if key != "strategy"
+        }
+    )
     deflation = _deflate(best_result, sensitivity.best.metrics, len(cells))
 
-    records = [sensitivity]
+    records = [_summarise_sweep(sensitivity)]
     if forward is not None:
         records.append(forward)
     records.extend([permutation, monte_carlo, deflation, baseline])
@@ -405,6 +454,21 @@ def cmd_validate(args: argparse.Namespace, stream) -> int:
     print(file=stream)
     print(render_validation(*records, width=width), file=stream)
     return 0
+
+
+def _summarise_sweep(sensitivity) -> _Sweep:
+    params = sensitivity.best.params
+    return _Sweep(
+        n_cells=sensitivity.n_cells,
+        n_scored=sensitivity.n_scored,
+        best_params=", ".join(f"{k}={v}" for k, v in sorted(params.items())) or "(defaults)",
+        best_objective=sensitivity.best_objective,
+        median_objective=sensitivity.median_objective,
+        profitable_fraction=sensitivity.profitable_fraction,
+        plateau_score=sensitivity.plateau_score,
+        n_neighbours=sensitivity.n_neighbours,
+        verdict=sensitivity.verdict,
+    )
 
 
 def _grid_for(name: str, fixed: dict) -> list:

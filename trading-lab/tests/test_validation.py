@@ -29,7 +29,6 @@ from datetime import datetime, timedelta, timezone
 
 from tradelab.data import synthetic_random_walk, synthetic_trending
 from tradelab.engine import Backtester
-from tradelab.metrics import summarize
 from tradelab.strategies import DonchianBreakout
 from tradelab.types import BacktestResult, CostConfig, Direction, EquityPoint, ExitReason, Trade
 from tradelab.validation import (

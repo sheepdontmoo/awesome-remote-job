@@ -31,6 +31,14 @@ class BarWindow(Sequence[Bar]):
     bar that just closed, `window[-2]` the one before it. Any positive index
     beyond `end`, or any attempt to slice past it, raises `LookAheadError`
     rather than silently returning tomorrow's price.
+
+    The guard covers every public access path - indexing, slicing, iteration,
+    `len`, and the `Sequence` mixins built on them. It is not a sandbox: the
+    full series is held in `_bars`, and code that reaches for that private
+    attribute gets the future with no complaint. Copying the visible prefix on
+    every bar would close that hole and make the class quadratic, which for a
+    package whose validation suite runs thousands of backtests is the worse
+    trade. So: accidental look-ahead crashes, deliberate look-ahead does not.
     """
 
     __slots__ = ("_bars", "_end")

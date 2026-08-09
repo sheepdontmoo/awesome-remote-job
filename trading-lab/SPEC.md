@@ -54,32 +54,66 @@ At the end of data, close any open position at the final close with
 
 ### Fill pricing
 
-With `price_is_mid=True`, `half = spread_points / 2`:
+How the spread splits across the two legs depends on what the bars are. The
+invariant that must hold in both cases: **a round turn pays exactly one
+spread.**
 
-| Action           | Base price | Adjustment                          |
-|------------------|-----------|--------------------------------------|
-| Buy (enter long / exit short)  | mid | `+ half*point + slippage*point` |
-| Sell (enter short / exit long) | mid | `- half*point - slippage*point` |
+| Bars | Buy (enter long / exit short) | Sell (enter short / exit long) |
+|---|---|---|
+| Mid (`price_is_mid=True`) | `+ (spread/2 + slip) * point` | `- (spread/2 + slip) * point` |
+| Bid (`price_is_mid=False`) | `+ (spread + slip) * point` | `- slip * point` |
 
-Limit-style fills (the take-profit) pay the half-spread but **no** slippage.
-Stop fills pay both — a stop becomes a market order when it triggers.
+Bid-priced bars are what MetaTrader exports. The printed price *is* the bid, so
+a sell deals there and pays nothing, while a buy must lift a full spread. A
+symmetric half applied to both legs is wrong for this case, and applying zero
+to both — as the first implementation did — lets anyone testing their own
+broker's export trade for free, including under `stress()`.
 
-Attribute the half-spread to `Trade.spread_cost` and the slippage to
+Limit-style fills (the take-profit) pay the spread but **no** slippage. Stop
+fills pay both: a stop becomes a market order when it triggers.
+
+Attribute the spread to `Trade.spread_cost` and the slippage to
 `Trade.slippage_cost`, in account currency, summed over both legs.
+
+### Financing
+
+Rollovers fire once per day at `rollover_hour_utc`, for every night a position
+is held including nights hidden inside a data gap. **Saturday and Sunday are
+skipped** when `triple_swap_weekday` is set: the Wednesday triple already
+settles the weekend value date, so charging the weekend as well bills nine
+nights a calendar week instead of seven. When `triple_swap_weekday` is None the
+instrument finances all seven days and nothing is skipped.
 
 ### Sizing
 
 ```
-stop_distance = abs(entry_price - stop_loss)
-if points(stop_distance) < risk.min_stop_points: skip the trade (warn)
-risk_cash = equity * risk.risk_per_trade
-lots      = risk_cash / (stop_distance * instrument.contract_size)
-lots      = instrument.round_lots(min(lots, risk.max_lots))
+quoted_points = points(abs(bar.open - stop_loss))
+if quoted_points < risk.min_stop_points: skip the trade (warn)
+stop_distance = abs(entry_fill - stop_loss)
+risk_cash     = equity * risk.risk_per_trade
+lots          = risk_cash / (stop_distance * instrument.contract_size)
+lots          = instrument.round_lots(min(lots, risk.max_lots))
 if lots == 0: skip the trade (warn)
 ```
 
-Gross P&L for a closed round turn:
-`(exit_price - entry_price) * int(direction) * lots * contract_size`.
+Two distances on purpose. The guard answers the question the user configured —
+"is my stop at least N points from the price?" — so it measures from the bar.
+Sizing then uses the fill, because that is the distance the account really
+travels. `round_lots` caps to `max_lot` *before* flooring to `lot_step`, so the
+result is always a tradable size.
+
+### P&L
+
+Gross P&L for a closed round turn is measured **mid-to-mid**:
+`(exit_mid - entry_mid) * int(direction) * lots * contract_size`.
+
+That is deliberately not the difference between the two fills. The fills
+already carry spread and slippage, so measuring gross from them and then
+subtracting the cost fields charges both twice — which understates net P&L,
+understates every reported cost figure, and marks a new position down by twice
+its entry costs on the equity curve. Gross is the costless ideal; `net_pnl` is
+`gross_pnl - total_costs`; and `gross - spread - slippage` recovers the
+realised move between the fills.
 
 The engine **must** set `Trade.contract_size` from the instrument when it opens
 a position. `Trade.risk_amount` and `Trade.r_multiple` depend on it; leaving the

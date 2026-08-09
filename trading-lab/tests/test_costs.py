@@ -76,11 +76,31 @@ class FillPricingTests(unittest.TestCase):
         self.assertAlmostEqual(fill.price, 1.10000 - 0.5 * POINT, places=10)
         self.assertEqual(fill.slippage_points, 0.0)
 
-    def test_bid_priced_data_pays_no_half_spread(self) -> None:
+    def test_bid_priced_data_pays_the_whole_spread_on_the_buy_leg(self) -> None:
+        # The printed price IS the bid, so a sell deals there and a buy must
+        # lift a full spread above it. Charging half to each leg - or, as an
+        # earlier version did, nothing to either - lets anyone backtesting a
+        # MetaTrader export trade for free.
         model = CostModel(CostConfig(price_is_mid=False), INSTRUMENT)
-        fill = model.fill(1.10000, buying=True)
-        self.assertEqual(fill.spread_points, 0.0)
-        self.assertAlmostEqual(fill.price, 1.10000 + 2.0 * POINT, places=10)
+        buy = model.fill(1.10000, buying=True)
+        self.assertEqual(buy.spread_points, 1.0)
+        self.assertAlmostEqual(buy.price, 1.10000 + 3.0 * POINT, places=10)
+        sell = model.fill(1.10000, buying=False)
+        self.assertEqual(sell.spread_points, 0.0)
+        self.assertAlmostEqual(sell.price, 1.10000 - 2.0 * POINT, places=10)
+
+    def test_a_round_turn_pays_exactly_one_spread_either_way(self) -> None:
+        # The invariant that survives both quoting conventions.
+        for price_is_mid in (True, False):
+            config = CostConfig(spread_points=1.6, price_is_mid=price_is_mid)
+            model = CostModel(config, INSTRUMENT)
+            legs = model.spread_points(buying=True) + model.spread_points(buying=False)
+            self.assertAlmostEqual(legs, 1.6, places=10, msg=f"price_is_mid={price_is_mid}")
+
+    def test_stress_still_bites_on_bid_priced_data(self) -> None:
+        config = CostConfig(spread_points=2.0, price_is_mid=False).stress(5.0)
+        model = CostModel(config, INSTRUMENT)
+        self.assertEqual(model.spread_points(buying=True), 10.0)
 
     def test_commission_is_one_side_only(self) -> None:
         self.assertAlmostEqual(self.model.commission(2.0), 7.00, places=10)
@@ -110,13 +130,31 @@ class SwapTests(unittest.TestCase):
         self.assertAlmostEqual(triple, 3.0 * single, places=10)
         self.assertAlmostEqual(triple, -2.40, places=10)
 
-    def test_a_friday_to_monday_hold_crosses_three_rollovers(self) -> None:
+    def test_the_weekend_rollovers_are_skipped_not_charged(self) -> None:
+        # The Wednesday triple already settles the weekend value date. Charging
+        # Saturday and Sunday as well bills nine nights a week instead of seven.
         friday = datetime(2021, 3, 5, 20, 0, tzinfo=timezone.utc)
         monday = datetime(2021, 3, 8, 20, 0, tzinfo=timezone.utc)
         self.assertEqual(friday.weekday(), 4)
         crossings = self.model.rollovers_between(friday, monday)
-        self.assertEqual([c.strftime("%a %d %H:%M") for c in crossings],
-                         ["Fri 05 21:00", "Sat 06 21:00", "Sun 07 21:00"])
+        self.assertEqual([c.strftime("%a %d %H:%M") for c in crossings], ["Fri 05 21:00"])
+
+    def test_a_calendar_week_costs_seven_nights_not_nine(self) -> None:
+        monday = datetime(2021, 3, 1, 0, 0, tzinfo=timezone.utc)
+        crossings = self.model.rollovers_between(monday, monday + timedelta(days=7))
+        self.assertEqual([c.strftime("%a") for c in crossings],
+                         ["Mon", "Tue", "Wed", "Thu", "Fri"])
+        nights = sum(
+            self.model.swap(Direction.LONG, 1.0, c) for c in crossings
+        ) / self.model.swap(Direction.LONG, 1.0, monday)
+        self.assertAlmostEqual(nights, 7.0, places=9)
+
+    def test_an_instrument_that_finances_every_day_skips_nothing(self) -> None:
+        # Crypto and some index CFDs have no triple day and roll all seven.
+        model = CostModel(CostConfig(triple_swap_weekday=None), INSTRUMENT)
+        monday = datetime(2021, 3, 1, 0, 0, tzinfo=timezone.utc)
+        crossings = model.rollovers_between(monday, monday + timedelta(days=7))
+        self.assertEqual(len(crossings), 7)
 
     def test_one_bar_inside_a_day_crosses_nothing(self) -> None:
         start = datetime(2021, 3, 2, 10, 0, tzinfo=timezone.utc)
@@ -139,12 +177,18 @@ class RoundTripTests(unittest.TestCase):
 
         entry fill  = 1.10000 + (0.5 + 2.0) * 1e-5 = 1.1000250
         exit  fill  = 1.10100 - (0.5 + 2.0) * 1e-5 = 1.1009750
-        gross       = (1.1009750 - 1.1000250) * 1.0 * 100,000 =  95.00
+        gross       = (1.10100 - 1.10000) * 1.0 * 100,000     = 100.00
         commission  = 3.50 * 2 sides                          =   7.00
         spread      = 0.5 points * 2 legs * 1.00 per point    =   1.00
         slippage    = 2.0 points * 2 legs * 1.00 per point    =   4.00
         swap        = no rollover crossed inside one morning  =   0.00
-        net         = 95.00 - 7.00 - 1.00 - 4.00              =  83.00
+        net         = 100.00 - 7.00 - 1.00 - 4.00             =  88.00
+
+    Gross is measured mid-to-mid, which is exactly the number a costless
+    backtest would print. Measuring it fill-to-fill instead gives 95.00 - the
+    spread and slippage already taken - and subtracting them again afterwards
+    charges them twice, understating both the net and, more insidiously, the
+    reported cost of trading.
 
     Every one of those numbers is asserted separately below. The bars sit
     between 10:00 and 12:00 UTC so that the 21:00 rollover is never crossed.
@@ -171,8 +215,19 @@ class RoundTripTests(unittest.TestCase):
         self.assertAlmostEqual(self.trade.entry_price, 1.1000250, places=9)
         self.assertAlmostEqual(self.trade.exit_price, 1.1009750, places=9)
 
-    def test_gross_pnl(self) -> None:
-        self.assertAlmostEqual(self.trade.gross_pnl, 95.00, places=6)
+    def test_gross_pnl_is_the_costless_mid_to_mid_move(self) -> None:
+        self.assertAlmostEqual(self.trade.gross_pnl, 100.00, places=6)
+
+    def test_each_cost_is_charged_exactly_once(self) -> None:
+        # The realised move between the two fills already carries spread and
+        # slippage, so it must equal gross minus those two and nothing else.
+        realised = (self.trade.exit_price - self.trade.entry_price) * 1.0 * 100_000.0
+        self.assertAlmostEqual(realised, 95.00, places=6)
+        self.assertAlmostEqual(
+            realised,
+            self.trade.gross_pnl - self.trade.spread_cost - self.trade.slippage_cost,
+            places=6,
+        )
 
     def test_commission_covers_both_sides(self) -> None:
         self.assertAlmostEqual(self.trade.commission, 7.00, places=10)
@@ -188,10 +243,10 @@ class RoundTripTests(unittest.TestCase):
 
     def test_total_costs_and_net_pnl(self) -> None:
         self.assertAlmostEqual(self.trade.total_costs, 12.00, places=6)
-        self.assertAlmostEqual(self.trade.net_pnl, 83.00, places=6)
+        self.assertAlmostEqual(self.trade.net_pnl, 88.00, places=6)
 
     def test_the_account_moved_by_exactly_the_net(self) -> None:
-        self.assertAlmostEqual(self.result.final_equity, 10_083.00, places=6)
+        self.assertAlmostEqual(self.result.final_equity, 10_088.00, places=6)
 
 
 class ChargedEveryNightTests(unittest.TestCase):
@@ -221,12 +276,13 @@ class ChargedEveryNightTests(unittest.TestCase):
         self.assertEqual(len(result.trades), 1)
         return result.trades[0]
 
-    def test_a_friday_to_monday_hold_is_charged_for_every_intervening_night(self) -> None:
+    def test_a_friday_to_monday_hold_is_charged_the_friday_night_only(self) -> None:
         friday = datetime(2021, 3, 5, 20, 0, tzinfo=timezone.utc)
         monday = datetime(2021, 3, 8, 20, 0, tzinfo=timezone.utc)
         trade = self._hold(friday, monday)
-        # Friday, Saturday and Sunday nights, none of them the triple weekday.
-        self.assertAlmostEqual(trade.swap, 3.0 * -0.80, places=9)
+        # Only Friday's rollover falls inside the hold. The weekend is not
+        # charged here because Wednesday's triple already paid for it.
+        self.assertAlmostEqual(trade.swap, -0.80, places=9)
 
     def test_the_triple_swap_weekday_is_charged_three_times_by_the_engine(self) -> None:
         tuesday = datetime(2021, 3, 2, 20, 0, tzinfo=timezone.utc)

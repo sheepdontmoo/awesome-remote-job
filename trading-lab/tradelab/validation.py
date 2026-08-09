@@ -270,7 +270,11 @@ def walk_forward(
     warnings: list[str] = []
     folds: list[FoldResult] = []
 
-    warmup = strategy_factory(dict(param_grid[0])).warmup
+    # The max over the whole grid, not the first cell. Reading warmup from one
+    # arbitrary configuration lets a fold whose selected parameters need far
+    # more history pass the check, trade nothing, and then be folded into the
+    # out-of-sample mean as a flat zero rather than as "could not run".
+    warmup = max(strategy_factory(dict(cell)).warmup for cell in param_grid)
 
     for index, (train_bars, test_bars) in enumerate(splits):
         if len(test_bars) <= warmup:
@@ -514,8 +518,12 @@ def _monte_carlo_verdict(
     threshold: float,
     n_runs: int,
 ) -> str:
+    # "closed-trade" rather than "realised": this drawdown is measured on a
+    # ladder of closed P&L, which never marks an open position to market. The
+    # account's own curve dips lower. Calling it the realised max drawdown
+    # reports the flattering of the two numbers under the name of the other.
     head = (
-        f"the realised max drawdown of {_pct(observed)} sits at the "
+        f"the closed-trade max drawdown of {_pct(observed)} sits at the "
         f"{_ordinal(round(percentile * 100))} percentile of {n_runs} reshuffles "
         f"(median {_pct(median)}, p95 {_pct(p95)}, p99 {_pct(p99)})"
     )
@@ -580,42 +588,59 @@ class PermutationResult:
 def surrogate_series(bars: list[Bar], rng: random.Random) -> list[Bar]:
     """Rebuild `bars` from a shuffled copy of their own log returns.
 
-    The surrogate keeps the timestamps, the number of bars, the starting
-    price, and the exact multiset of bar-to-bar returns - so drift, volatility
-    and the fat tails all survive. What it destroys is the *order*: any trend,
-    mean reversion, momentum or level that a strategy could trade is gone.
-    Intrabar range is carried over by rescaling each original bar's
-    open/high/low around its new close, which preserves the size of the bar
-    roughly but not the intrabar path.
+    Each bar is decomposed into four log quantities measured against the
+    previous close - the opening gap, the body, and the two wicks - and those
+    four-tuples are shuffled **as units**. The surrogate therefore preserves
+    the timestamps, the starting price, the exact multiset of close-to-close
+    returns, the distribution of opening gaps, and the distribution of wick
+    sizes, along with the association between them. What it destroys is the
+    *order*: any trend, mean reversion, momentum or level a strategy could
+    trade is gone.
 
-    That last point is the honest weakness of this test: the surrogate's open
-    is derived from its own close rather than from the previous bar's, so gap
-    behaviour is not faithfully reproduced. A strategy that lives on gaps will
-    be judged against a null that has the wrong kind of gaps.
+    Keeping the bar's shape attached to its own return is the whole point. An
+    earlier version rebuilt each bar by scaling the original open/high/low
+    around a new close taken from a different point in the series. That
+    carried each bar's high/close and low/close ratios over verbatim while the
+    close followed an unrelated path, which inflated mean true range by about
+    38% and manufactured an opening gap on every bar. The null was then not
+    "the same market with its order destroyed" but "a materially more hostile
+    market", surrogates scored far worse than the real series by construction,
+    and the test returned significant p-values for strategies with no edge at
+    all - the exact failure this module exists to prevent.
     """
     n = len(bars)
     if n < 3:
         return list(bars)
 
-    log_returns = []
+    shapes: list[tuple[float, float, float, float]] = []
     for i in range(1, n):
-        previous, current = bars[i - 1].close, bars[i].close
-        if previous <= 0.0 or current <= 0.0:
-            raise ValueError("permutation test needs strictly positive close prices")
-        log_returns.append(math.log(current / previous))
-    rng.shuffle(log_returns)
+        previous, current = bars[i - 1], bars[i]
+        if previous.close <= 0.0 or current.close <= 0.0 or current.open <= 0.0:
+            raise ValueError("permutation test needs strictly positive prices")
+        if current.low <= 0.0:
+            raise ValueError("permutation test needs strictly positive prices")
+        body_top = max(current.open, current.close)
+        body_bottom = min(current.open, current.close)
+        shapes.append((
+            math.log(current.open / previous.close),   # opening gap
+            math.log(current.close / current.open),    # body
+            math.log(current.high / body_top),         # upper wick, >= 0
+            math.log(body_bottom / current.low),       # lower wick, >= 0
+        ))
+    rng.shuffle(shapes)
 
     out = [bars[0]]
     close = bars[0].close
     for i in range(1, n):
-        close *= math.exp(log_returns[i - 1])
-        source = bars[i]
-        scale = close / source.close
-        open_ = source.open * scale
-        high = max(source.high * scale, open_, close)
-        low = min(source.low * scale, open_, close)
+        gap, body, upper, lower = shapes[i - 1]
+        open_ = close * math.exp(gap)
+        close = open_ * math.exp(body)
+        # max/min guard the float round trip: exp(0) is not exactly 1.0, and a
+        # high a hair under the open would fail Bar's own validation.
+        high = max(max(open_, close) * math.exp(upper), open_, close)
+        low = min(min(open_, close) * math.exp(-lower), open_, close)
         out.append(
-            Bar(ts=source.ts, open=open_, high=high, low=low, close=close, volume=source.volume)
+            Bar(ts=bars[i].ts, open=open_, high=high, low=low, close=close, volume=bars[i].volume)
         )
     return out
 
@@ -664,12 +689,19 @@ def permutation_test(
         value = _evaluate(strategy_factory, params, fake, backtester_factory, objective).objective
         if math.isfinite(value):
             scores.append(value)
+            if value >= observed:
+                at_least += 1
         else:
             unscored += 1
-        if value >= observed:
-            at_least += 1
 
-    p_value = (1 + at_least) / (1 + n_perms)
+    # Only scored surrogates go in the denominator. A surrogate that traded too
+    # rarely to score has not been beaten by the strategy - it simply did not
+    # run - and leaving it in the denominator silently records it as "worse
+    # than observed". With u of n unscored that caps p at (1 + n - u) / (1 + n)
+    # regardless of the strategy, which is a downward bias exactly when the
+    # surrogate construction suppresses trading.
+    n_scored = len(scores)
+    p_value = (1 + at_least) / (1 + n_scored) if n_scored else float("nan")
     return PermutationResult(
         n_perms=n_perms,
         observed=observed,
