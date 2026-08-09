@@ -49,9 +49,12 @@ class BarWindow(Sequence[Bar]):
     def __getitem__(self, key):  # type: ignore[override]
         n = self._end + 1
         if isinstance(key, slice):
+            # The raw stop has to be tested *before* `indices`, which silently
+            # clamps it to n. Clamping is why `window[0:n + 5]` would otherwise
+            # return a short window instead of announcing the look-ahead.
+            if key.stop is not None and key.stop > n:
+                raise LookAheadError(f"slice reaches bar {key.stop} but only {n} bars have closed")
             start, stop, step = key.indices(n)
-            if stop > n:
-                raise LookAheadError(f"slice reaches bar {stop} but only {n} bars have closed")
             return [self._bars[i] for i in range(start, stop, step)]
         idx = int(key)
         if idx < 0:
